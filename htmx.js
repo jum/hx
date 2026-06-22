@@ -278,7 +278,14 @@ var htmx = (function() {
        * @type boolean
        * @default true
        */
-      historyRestoreAsHxRequest: true
+      historyRestoreAsHxRequest: true,
+      /**
+       * Whether to report input validation errors to the end user and update focus to the first input that fails validation.
+       * This should always be enabled as this matches default browser form submit behaviour
+       * @type boolean
+       * @default false
+       */
+      reportValidityOfForms: false
     },
     /** @type {typeof parseInterval} */
     parseInterval: null,
@@ -289,7 +296,7 @@ var htmx = (function() {
     location,
     /** @type {typeof internalEval} */
     _: null,
-    version: '2.0.5'
+    version: '2.0.9'
   }
   // Tsc madness part 2
   htmx.onLoad = onLoadHelper
@@ -518,6 +525,9 @@ var htmx = (function() {
    * @returns {Document}
    */
   function parseHTML(resp) {
+    if ('parseHTMLUnsafe' in Document) {
+      return Document.parseHTMLUnsafe(resp)
+    }
     const parser = new DOMParser()
     return parser.parseFromString(resp, 'text/html')
   }
@@ -834,10 +844,11 @@ var htmx = (function() {
    * @returns {string}
    */
   function normalizePath(path) {
-    // use dummy base URL to allow normalize on path only
-    const url = new URL(path, 'http://x')
-    if (url) {
+    try {
+      const url = new URL(path, window.location.href)
       path = url.pathname + url.search
+    } catch (e) {
+      // fallback for malformed URLs
     }
     // remove trailing slash, unless index page
     if (path != '/') {
@@ -1413,7 +1424,7 @@ var htmx = (function() {
    * @param {Element} mergeFrom
    */
   function cloneAttributes(mergeTo, mergeFrom) {
-    forEach(mergeTo.attributes, function(attr) {
+    forEach(Array.from(mergeTo.attributes), function(attr) {
       if (!mergeFrom.hasAttribute(attr.name) && shouldSettleAttribute(attr.name)) {
         mergeTo.removeAttribute(attr.name)
       }
@@ -1498,7 +1509,7 @@ var htmx = (function() {
       oobElement.parentNode.removeChild(oobElement)
     } else {
       oobElement.parentNode.removeChild(oobElement)
-      triggerErrorEvent(getDocument().body, 'htmx:oobErrorNoTarget', { content: oobElement })
+      triggerErrorEvent(getDocument().body, 'htmx:oobErrorNoTarget', { content: oobElement, target: selector })
     }
     return oobValue
   }
@@ -1965,7 +1976,7 @@ var htmx = (function() {
         }
       }
 
-      target.classList.remove(htmx.config.swappingClass)
+      removeClassFromElement(target, htmx.config.swappingClass)
       forEach(settleInfo.elts, function(elt) {
         if (elt.classList) {
           elt.classList.add(htmx.config.settlingClass)
@@ -1986,7 +1997,7 @@ var htmx = (function() {
         })
         forEach(settleInfo.elts, function(elt) {
           if (elt.classList) {
-            elt.classList.remove(htmx.config.settlingClass)
+            removeClassFromElement(elt, htmx.config.settlingClass)
           }
           triggerEvent(elt, 'htmx:afterSettle', swapOptions.eventInfo)
         })
@@ -2424,19 +2435,22 @@ var htmx = (function() {
    * @returns {boolean}
    */
   function shouldCancel(evt, elt) {
-    if (evt.type === 'submit' || evt.type === 'click') {
-      // use elt from event that was submitted/clicked where possible to determining if default form/link behavior should be canceled
-      elt = asElement(evt.target) || elt
-      if (elt.tagName === 'FORM') {
+    if (evt.type === 'submit' && elt.tagName === 'FORM') {
+      return true
+    } else if (evt.type === 'click') {
+      // find button wrapping the trigger element
+      const btn = /** @type {HTMLButtonElement|HTMLInputElement|null} */ (elt.closest('input[type="submit"], button'))
+      // Do not cancel on buttons that 1) don't have a related form or 2) have a type attribute of 'reset'/'button'.
+      if (btn && btn.form && btn.type === 'submit') {
         return true
       }
-      // @ts-ignore Do not cancel on buttons that 1) don't have a related form or 2) have a type attribute of 'reset'/'button'.
-      // The properties will resolve to undefined for elements that don't define 'type' or 'form', which is fine
-      if (elt.form && elt.type === 'submit') {
-        return true
-      }
-      if (elt instanceof HTMLAnchorElement && elt.href &&
-        (elt.getAttribute('href') === '#' || elt.getAttribute('href').indexOf('#') !== 0)) {
+
+      // find link wrapping the trigger element
+      const link = elt.closest('a')
+      // Allow links with href="#fragment" (anchors with content after #) to perform normal fragment navigation.
+      // Cancel default action for links with href="#" (bare hash) to prevent scrolling to top and unwanted URL changes.
+      const samePageAnchor = /^#.+/
+      if (link && link.href && !samePageAnchor.test(link.getAttribute('href'))) {
         return true
       }
     }
@@ -2513,7 +2527,7 @@ var htmx = (function() {
         if (ignoreBoostedAnchorCtrlClick(elt, evt)) {
           return
         }
-        if (explicitCancel || shouldCancel(evt, elt)) {
+        if (explicitCancel || shouldCancel(evt, eltToListenOn)) {
           evt.preventDefault()
         }
         if (maybeFilterEvent(triggerSpec, elt, evt)) {
@@ -2853,6 +2867,9 @@ var htmx = (function() {
       return
     }
     const form = getRelatedForm(elt)
+    if (!form) {
+      return
+    }
     return getInternalData(form)
   }
 
@@ -3095,7 +3112,7 @@ var htmx = (function() {
       htmx.logger(elt, eventName, detail)
     }
     if (detail.error) {
-      logError(detail.error)
+      logError(detail.error + (detail.target ? ', ' + detail.target : ''))
       triggerEvent(elt, 'htmx:error', { errorInfo: detail })
     }
     let eventResult = elt.dispatchEvent(event)
@@ -3113,7 +3130,7 @@ var htmx = (function() {
   //= ===================================================================
   // History Support
   //= ===================================================================
-  let currentPathForHistory = location.pathname + location.search
+  let currentPathForHistory
 
   /**
    * @param {string} path
@@ -3124,6 +3141,8 @@ var htmx = (function() {
       sessionStorage.setItem('htmx-current-path-for-history', path)
     }
   }
+
+  setCurrentPathForHistory(location.pathname + location.search)
 
   /**
    * @returns {Element}
@@ -3376,8 +3395,10 @@ var htmx = (function() {
     forEach(disabledElts, function(disabledElement) {
       const internalData = getInternalData(disabledElement)
       internalData.requestCount = (internalData.requestCount || 0) + 1
-      disabledElement.setAttribute('disabled', '')
-      disabledElement.setAttribute('data-disabled-by-htmx', '')
+      if (!disabledElement.hasAttribute('disabled')) {
+        disabledElement.setAttribute('disabled', '')
+        disabledElement.setAttribute('data-disabled-by-htmx', '')
+      }
     })
     return disabledElts
   }
@@ -3394,12 +3415,12 @@ var htmx = (function() {
     forEach(indicators, function(ic) {
       const internalData = getInternalData(ic)
       if (internalData.requestCount === 0) {
-        ic.classList.remove.call(ic.classList, htmx.config.requestClass)
+        removeClassFromElement(ic, htmx.config.requestClass)
       }
     })
     forEach(disabled, function(disabledElement) {
       const internalData = getInternalData(disabledElement)
-      if (internalData.requestCount === 0) {
+      if (internalData.requestCount === 0 && disabledElement.hasAttribute('data-disabled-by-htmx')) {
         disabledElement.removeAttribute('disabled')
         disabledElement.removeAttribute('data-disabled-by-htmx')
       }
@@ -3544,8 +3565,17 @@ var htmx = (function() {
     if (element.willValidate) {
       triggerEvent(element, 'htmx:validation:validate')
       if (!element.checkValidity()) {
+        if (
+          triggerEvent(element, 'htmx:validation:failed', {
+            message: element.validationMessage,
+            validity: element.validity
+          }) &&
+          !errors.length &&
+          htmx.config.reportValidityOfForms
+        ) {
+          element.reportValidity()
+        }
         errors.push({ elt: element, message: element.validationMessage, validity: element.validity })
-        triggerEvent(element, 'htmx:validation:failed', { message: element.validationMessage, validity: element.validity })
       }
     }
   }
@@ -4051,7 +4081,10 @@ var htmx = (function() {
             targetOverride: resolvedTarget,
             swapOverride: context.swap,
             select: context.select,
-            returnPromise: true
+            returnPromise: true,
+            push: context.push,
+            replace: context.replace,
+            selectOOB: context.selectOOB
           })
       }
     } else {
@@ -4666,8 +4699,10 @@ var htmx = (function() {
     const requestPath = responseInfo.pathInfo.finalRequestPath
     const responsePath = responseInfo.pathInfo.responsePath
 
-    const pushUrl = getClosestAttributeValue(elt, 'hx-push-url')
-    const replaceUrl = getClosestAttributeValue(elt, 'hx-replace-url')
+    let pushUrl = responseInfo.etc.push || getClosestAttributeValue(elt, 'hx-push-url')
+    let replaceUrl = responseInfo.etc.replace || getClosestAttributeValue(elt, 'hx-replace-url')
+    if (pushUrl === 'false') pushUrl = null
+    if (replaceUrl === 'false') replaceUrl = null
     const elementIsBoosted = getInternalData(elt).boosted
 
     let saveType = null
@@ -4685,11 +4720,6 @@ var htmx = (function() {
     }
 
     if (path) {
-    // false indicates no push, return empty object
-      if (path === 'false') {
-        return {}
-      }
-
       // true indicates we want to follow wherever the server ended up sending us
       if (path === 'true') {
         path = responsePath || requestPath // if there is no response path, go with the original request path
@@ -4786,19 +4816,17 @@ var htmx = (function() {
     }
 
     if (hasHeader(xhr, /HX-Location:/i)) {
-      saveCurrentPageToHistory()
       let redirectPath = xhr.getResponseHeader('HX-Location')
-      /** @type {HtmxAjaxHelperContext&{path:string}} */
-      var redirectSwapSpec
+      /** @type {HtmxAjaxHelperContext&{path?:string}} */
+      var redirectSwapSpec = {}
       if (redirectPath.indexOf('{') === 0) {
         redirectSwapSpec = parseJSON(redirectPath)
         // what's the best way to throw an error if the user didn't include this
         redirectPath = redirectSwapSpec.path
         delete redirectSwapSpec.path
       }
-      ajaxHelper('get', redirectPath, redirectSwapSpec).then(function() {
-        pushUrlIntoHistory(redirectPath)
-      })
+      redirectSwapSpec.push = redirectSwapSpec.push ?? 'true'
+      ajaxHelper('get', redirectPath, redirectSwapSpec)
       return
     }
 
@@ -4897,7 +4925,7 @@ var htmx = (function() {
         selectOverride = xhr.getResponseHeader('HX-Reselect')
       }
 
-      const selectOOB = getClosestAttributeValue(elt, 'hx-select-oob')
+      const selectOOB = etc.selectOOB || getClosestAttributeValue(elt, 'hx-select-oob')
       const select = getClosestAttributeValue(elt, 'hx-select')
 
       swap(target, serverResponse, swapSpec, {
@@ -5058,12 +5086,14 @@ var htmx = (function() {
   function insertIndicatorStyles() {
     if (htmx.config.includeIndicatorStyles !== false) {
       const nonceAttribute = htmx.config.inlineStyleNonce ? ` nonce="${htmx.config.inlineStyleNonce}"` : ''
+      const indicator = htmx.config.indicatorClass
+      const request = htmx.config.requestClass
       getDocument().head.insertAdjacentHTML('beforeend',
-        '<style' + nonceAttribute + '>\
-      .' + htmx.config.indicatorClass + '{opacity:0}\
-      .' + htmx.config.requestClass + ' .' + htmx.config.indicatorClass + '{opacity:1; transition: opacity 200ms ease-in;}\
-      .' + htmx.config.requestClass + '.' + htmx.config.indicatorClass + '{opacity:1; transition: opacity 200ms ease-in;}\
-      </style>')
+        `<style${nonceAttribute}>` +
+        `.${indicator}{opacity:0;visibility: hidden} ` +
+        `.${request} .${indicator}, .${request}.${indicator}{opacity:1;visibility: visible;transition: opacity 200ms ease-in}` +
+        '</style>'
+      )
     }
   }
 
@@ -5094,7 +5124,7 @@ var htmx = (function() {
       "[hx-trigger='restored'],[data-hx-trigger='restored']"
     )
     body.addEventListener('htmx:abort', function(evt) {
-      const target = evt.target
+      const target = (/** @type {CustomEvent} */(evt)).detail.elt || evt.target
       const internalData = getInternalData(target)
       if (internalData && internalData.xhr) {
         internalData.xhr.abort()
@@ -5214,6 +5244,9 @@ var htmx = (function() {
  * @property {Object|FormData} [values]
  * @property {Record<string,string>} [headers]
  * @property {string} [select]
+ * @property {string} [push]
+ * @property {string} [replace]
+ * @property {string} [selectOOB]
  */
 
 /**
@@ -5260,6 +5293,9 @@ var htmx = (function() {
  * @property {Object|FormData} [values]
  * @property {boolean} [credentials]
  * @property {number} [timeout]
+ * @property {string} [push]
+ * @property {string} [replace]
+ * @property {string} [selectOOB]
  */
 
 /**
